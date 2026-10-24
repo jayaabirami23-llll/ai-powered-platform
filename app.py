@@ -47,6 +47,9 @@ db = mongo_client["AICTE_SmartVerify"]
 institutions = db["institutions"]
 applications = db["applications"]
 verification_checks = db["verification_checks"]
+signature_references = db["signature_references"]
+validation_reports = db["validation_reports"]
+
 
 
 # ---------------- HELPER FUNCTIONS ----------------
@@ -141,6 +144,145 @@ def name_found_in_text(name, text):
             return True
 
     return False
+
+from PIL import Image
+from pathlib import Path
+import os
+
+
+def calculate_signature_hash(image_path):
+    """Create a simple visual fingerprint of a signature image."""
+    with Image.open(image_path) as image:
+        image = image.convert("L").resize((16, 16))
+        pixels = list(image.getdata())
+
+    average = sum(pixels) / len(pixels)
+
+    # 256-bit average-hash fingerprint
+    return "".join("1" if pixel >= average else "0" for pixel in pixels)
+
+
+def compare_signature_hashes(hash1, hash2):
+    """Return a visual similarity score between 0 and 100."""
+    if not hash1 or not hash2 or len(hash1) != len(hash2):
+        return 0.0
+
+    differences = sum(a != b for a, b in zip(hash1, hash2))
+    return round((1 - differences / len(hash1)) * 100, 2)
+
+
+
+def check_duplicate_signature(signature_image_path):
+    """Compare against explicitly trusted signature references only."""
+
+    trusted_references = list(
+        signature_references.find(
+            {"record_source": "Trusted signature reference"},
+            {"_id": 0}
+        )
+    )
+
+    # No trusted reference: do not calculate or report a match.
+    if not trusted_references:
+        return {
+            "possible_duplicate": False,
+            "similarity_score": None,
+            "matched_reference_id": None,
+            "status": "reference_unavailable",
+            "message": (
+                "Duplicate check not performed: "
+                "no trusted signature reference is available."
+            )
+        }
+
+    current_hash = calculate_signature_hash(signature_image_path)
+    best_match = None
+    highest_score = 0.0
+
+    for record in trusted_references:
+        saved_hash = record.get("signature_hash", "")
+        score = compare_signature_hashes(current_hash, saved_hash)
+
+        if score > highest_score:
+            highest_score = score
+            best_match = record
+
+    possible_duplicate = highest_score >= 90
+
+    return {
+        "possible_duplicate": possible_duplicate,
+        "similarity_score": highest_score,
+        "matched_reference_id": (
+            best_match.get("signature_id") if best_match else None
+        ),
+        "status": (
+            "review_required" if possible_duplicate
+            else "no_high_match"
+        ),
+        "message": (
+            "High visual similarity found; manual review required."
+            if possible_duplicate
+            else "No high-similarity trusted reference found."
+        )
+    }
+
+
+
+def save_signature_reference(signature_id, signature_image_path):
+    """Save a trusted signature reference in MongoDB."""
+    signature_hash = calculate_signature_hash(signature_image_path)
+
+    signature_references.update_one(
+        {"signature_id": signature_id},
+        {
+            "$set": {
+                "signature_id": signature_id,
+                "signature_hash": signature_hash,
+                "record_source": "Trusted signature reference"
+            }
+        },
+        upsert=True
+    )
+
+    return True
+
+def extract_signature_crop(file_path, output_path, page_number=0):
+    """Crop the approximate handwritten-signature area from page 1."""
+    from pathlib import Path
+    from PIL import Image
+
+    with pymupdf.open(file_path) as pdf:
+        if page_number < 0 or page_number >= len(pdf):
+            raise ValueError("Invalid PDF page number.")
+
+        page = pdf[page_number]
+        pix = page.get_pixmap(
+            matrix=pymupdf.Matrix(2, 2),
+            alpha=False
+        )
+
+        image = Image.frombytes(
+            "RGB",
+            (pix.width, pix.height),
+            pix.samples
+        )
+
+    # Approximate crop coordinates based on the supplied page image.
+    width, height = image.size
+    left = int(width * 0.48)
+    top = int(height * 0.82)
+    right = int(width * 0.80)
+    bottom = int(height * 0.95)
+
+    signature_crop = image.crop((left, top, right, bottom))
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    signature_crop.save(output)
+
+    return str(output)
+
+
 
 
 # ---------------- DOCUMENT VERIFICATION ----------------
@@ -471,47 +613,86 @@ HTML_PAGE = """
                 is not proof of fraud. Human review is required before
                 an official decision.
             </p>
+            
+            <h3>Signature Duplicate Detection Report</h3>
+
+            {% if result.signature_report %}
+            
+            <div class="field">
+                <strong>Possible Duplicate:</strong>
+                {% if result.signature_report.status == "reference_unavailable" %}
+                    Not evaluated — trusted reference required
+                {% elif result.signature_report.possible_duplicate %}
+                    Yes — manual review required
+                {% else %}
+                    No high-similarity match found
+                {% endif %}
+            </div>
+ 
+            <div class="field">
+                <strong>Similarity Score:</strong>
+                {% if result.signature_report.similarity_score is not none %}
+                {{ result.signature_report.similarity_score }}%
+                {% else %}
+                    Not available
+                {% endif %}
+            </div>
+
+
+            <div class="field">
+                <strong>Matched Reference ID:</strong>
+                {{ result.signature_report.matched_reference_id or "No matching reference" }}
+            </div>
+
+            <div class="field">
+                <strong>Result:</strong>
+                {{ result.signature_report.message }}
+            </div>
+            {% else %}
+            <p>Signature verification report is not available.</p>
+            {% endif %}
+
             <h3>PDF Tampering Detection Report</h3>
 
-        {% if result.anomaly_report %}
-    <div class="field">
-        <strong>Risk Level:</strong>
-        {{ result.anomaly_report.risk_level }}
-    </div>
+            {% if result.anomaly_report %}
+            <div class="field">
+                <strong>Risk Level:</strong>
+                {{ result.anomaly_report.risk_level }}
+            </div>
 
-    <div class="field">
-        <strong>Anomaly Count:</strong>
-        {{ result.anomaly_report.anomaly_count }}
-    </div>
+            <div class="field">
+                <strong>Anomaly Count:</strong>
+                {{ result.anomaly_report.anomaly_count }}
+            </div>
 
-    <div class="field">
-        <strong>SHA-256 File Hash:</strong>
-        <code>{{ result.anomaly_report.file_sha256 }}</code>
-    </div>
+            <div class="field">
+                <strong>SHA-256 File Hash:</strong>
+                <code>{{ result.anomaly_report.file_sha256 }}</code>
+            </div>
 
-    <h4>Checks Performed</h4>
-    <ul>
-        {% for check_name, check_status in result.anomaly_report.checks.items() %}
-            <li><strong>{{ check_name }}:</strong> {{ check_status }}</li>
-        {% endfor %}
-    </ul>
+            <h4>Checks Performed</h4>
+            <ul>
+                {% for check_name, check_status in result.anomaly_report.checks.items() %}
+                <li><strong>{{ check_name }}:</strong> {{ check_status }}</li>
+                {% endfor %}
+            </ul>
 
-    <h4>Detected Indicators</h4>
-    <ul>
-        {% for finding in result.anomaly_report.anomalies %}
-            <li>{{ finding }}</li>
-        {% else %}
-            <li>No anomaly indicators found by the current checks.</li>
-        {% endfor %}
-    </ul>
+            <h4>Detected Indicators</h4>
+            <ul>
+                {% for finding in result.anomaly_report.anomalies %}
+                <li>{{ finding }}</li>
+                {% else %}
+                <li>No anomaly indicators found by the current checks.</li>
+                {% endfor %}
+            </ul>
 
-    <p class="note">
-        These results are preliminary indicators, not proof of forgery.
-        Manual verification is required.
-    </p>
-    {% else %}
-    <p>Tampering analysis report is unavailable.</p>
-        {% endif %}
+            <p class="note">
+            These results are preliminary indicators, not proof of forgery.
+            Manual verification is required.
+            </p>
+            {% else %}
+            <p>Tampering analysis report is unavailable.</p>
+            {% endif %}
         </section>
         {% endif %}
     </main>
@@ -588,6 +769,15 @@ def analyze_document_anomalies(file_path, document_text):
 
         file_sha256 = sha256.hexdigest()
         checks["file_hash_check"] = "Completed"
+        trusted_original_hash = (
+            "c132f7708fbf19901876fe7004e005653c4a0cc6059650bde7221600c44823d1"
+        )
+
+        if file_sha256 != trusted_original_hash:
+            add_finding(
+                "File hash differs from the trusted original reference. "
+                "The file may have been modified."
+            )
 
         # PDF-specific checks.
         if os.path.splitext(file_path)[1].lower() != ".pdf":
@@ -1150,6 +1340,38 @@ def verify():
 
         # Compare the document against reference records.
         result = verify_document(document_text)
+        
+        # Extract the signature area from the uploaded PDF.
+        signature_crop_path = str(
+            saved_path.with_name(
+                saved_path.stem + "_signature.png"
+            )
+        )
+
+        try:
+            extract_signature_crop(
+                str(saved_path),
+                signature_crop_path,
+                page_number=0
+            )
+
+            # Compare the extracted signature with saved references.
+            signature_report = check_duplicate_signature(
+                signature_crop_path
+            )
+
+        except Exception:
+            app.logger.exception("Signature check failed")
+            signature_report = {
+                "possible_duplicate": False,
+                "similarity_score": 0.0,
+                "matched_reference_id": None,
+                "message": "Signature check could not be completed."
+            }
+
+        # Attach signature results to the verification result.
+        result["signature_report"] = signature_report
+
         # Analyze PDF metadata and date anomalies
         anomaly_report = analyze_document_anomalies(
          str(saved_path),
@@ -1184,7 +1406,38 @@ def verify():
 
         # Save verification result.
         verification_checks.insert_one(verification_record)
+        # Save the detailed verification report to MongoDB.
+        validation_report = {
+            "report_id": "REP-" + uuid.uuid4().hex[:12].upper(),
+            "verification_id": verification_record["verification_id"],
+            "application_id": verification_record["application_id"],
+            "document_id": verification_record["document_id"],
+            "checked_at": datetime.now(timezone.utc),
+            "verification_status": verification_record["status"],
+            "file_sha256": (
+                anomaly_report.get("file_sha256")
+                or anomaly_report.get("sha256")
+                or anomaly_report.get("hash")
+            ),
+            "anomaly_count": anomaly_report.get(
+                "anomaly_count",
+                anomaly_report.get("count", 0)
+            ),
+            "risk_level": anomaly_report.get(
+                "risk_level", "Not available"
+            ),
+            "anomaly_report": anomaly_report,
+            "signature_report": signature_report,
+            "report_type": "PDF Verification"
+        }
 
+        print("DEBUG: Saving validation report...")
+        validation_reports.insert_one(validation_report)
+        print("DEBUG: Validation report saved successfully!")
+        app.logger.info(
+            "Validation report saved: %s",
+            validation_report["report_id"]
+        )
         return render_template_string(
             HTML_PAGE,
             result=result
@@ -1217,6 +1470,20 @@ def file_too_large(error):
         error="File is too large. Maximum allowed size is 10 MB."
     ), 413
 
+def test_signature_reference():
+    image_path = "uploads/signature_crop.png"
+
+    signature_hash = calculate_signature_hash(image_path)
+
+    print("Signature hash generated successfully!")
+    print("Hash length:", len(signature_hash))
+
+    save_signature_reference(
+        "SIG-DEMO-001",
+        image_path
+    )
+
+    print("Signature reference saved to MongoDB.")
 
 # ---------------- START APPLICATION ----------------
 
