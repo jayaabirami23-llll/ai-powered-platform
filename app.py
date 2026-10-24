@@ -198,6 +198,30 @@ def verify_document(document_text):
             )
         )
 
+    # Compare important fields with the database reference.
+    def normalize_value(value):
+        return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+    normalized_document = normalize_value(document_text)
+    reference_mismatches = []
+
+    if application:
+        fields_to_check = [
+            ("academic_year", "Academic Year"),
+            ("course", "Course"),
+            ("program", "Program"),
+            ("approved_intake_2026_27", "Approved Intake 2026-27")
+        ]
+
+        for field, label in fields_to_check:
+            expected_value = application.get(field)
+
+            if expected_value is not None and str(expected_value).strip():
+                normalized_expected = normalize_value(expected_value)
+
+                if normalized_expected not in normalized_document:
+                    reference_mismatches.append(label)
+
     # Decide the verification result.
     if not extracted_id:
         status = "Manual Review"
@@ -214,6 +238,13 @@ def verify_document(document_text):
     elif not institution_match:
         status = "Mismatch"
         reason = "Institution name does not match the reference record."
+    
+    elif reference_mismatches:
+        status = "Mismatch"
+        reason = (
+            "Reference details were not found in the uploaded document: "
+            + ", ".join(reference_mismatches)
+        )
 
     else:
         status = "Match"
@@ -402,7 +433,7 @@ HTML_PAGE = """
 
             <p>{{ result.reason }}</p>
 
-            <div class="field">
+            <div class="field"
                 <strong>Application ID:</strong>
                 {{ result.application_id }}
             </div>
@@ -440,6 +471,47 @@ HTML_PAGE = """
                 is not proof of fraud. Human review is required before
                 an official decision.
             </p>
+            <h3>PDF Tampering Detection Report</h3>
+
+        {% if result.anomaly_report %}
+    <div class="field">
+        <strong>Risk Level:</strong>
+        {{ result.anomaly_report.risk_level }}
+    </div>
+
+    <div class="field">
+        <strong>Anomaly Count:</strong>
+        {{ result.anomaly_report.anomaly_count }}
+    </div>
+
+    <div class="field">
+        <strong>SHA-256 File Hash:</strong>
+        <code>{{ result.anomaly_report.file_sha256 }}</code>
+    </div>
+
+    <h4>Checks Performed</h4>
+    <ul>
+        {% for check_name, check_status in result.anomaly_report.checks.items() %}
+            <li><strong>{{ check_name }}:</strong> {{ check_status }}</li>
+        {% endfor %}
+    </ul>
+
+    <h4>Detected Indicators</h4>
+    <ul>
+        {% for finding in result.anomaly_report.anomalies %}
+            <li>{{ finding }}</li>
+        {% else %}
+            <li>No anomaly indicators found by the current checks.</li>
+        {% endfor %}
+    </ul>
+
+    <p class="note">
+        These results are preliminary indicators, not proof of forgery.
+        Manual verification is required.
+    </p>
+    {% else %}
+    <p>Tampering analysis report is unavailable.</p>
+        {% endif %}
         </section>
         {% endif %}
     </main>
@@ -447,122 +519,318 @@ HTML_PAGE = """
 </html>
 """
 
+
+
 def analyze_document_anomalies(file_path, document_text):
+    import hashlib
+    import os
+    import re
+    from datetime import datetime
+
     findings = []
+    checks = {
+        "metadata_check": "Not completed",
+        "revision_check": "Not completed",
+        "font_check": "Not completed",
+        "issue_date_check": "Not completed",
+        "active_content_check": "Not completed",
+        "file_hash_check": "Not completed"
+    }
+
+    file_sha256 = None
+    page_count = 0
+    metadata = {}
+
+    def add_finding(message):
+        if message not in findings:
+            findings.append(message)
+
+    def parse_pdf_date(value):
+        if not value:
+            return None
+
+        match = re.search(
+            r"D:(\d{4})(\d{2})?(\d{2})?"
+            r"(\d{2})?(\d{2})?(\d{2})?",
+            str(value)
+        )
+
+        if not match:
+            return None
+
+        parts = [
+            int(value or 0)
+            for value in match.groups()
+        ]
+
+        try:
+            return datetime(
+                parts[0],
+                parts[1] or 1,
+                parts[2] or 1,
+                parts[3],
+                parts[4],
+                parts[5]
+            )
+        except ValueError:
+            return None
 
     try:
-        with pymupdf.open(file_path) as pdf:
-            metadata = pdf.metadata or {}
-            
-# Inspect PDF revision indicators
-    with open(file_path, "rb") as pdf_file:
-    pdf_bytes = pdf_file.read()
+        # 1. Calculate SHA-256 fingerprint of the uploaded file.
+        sha256 = hashlib.sha256()
 
-    eof_count = pdf_bytes.count(b"%%EOF")
-    previous_xref_count = pdf_bytes.count(b"/Prev")
+        with open(file_path, "rb") as uploaded_file:
+            for chunk in iter(
+                lambda: uploaded_file.read(1024 * 1024),
+                b""
+            ):
+                sha256.update(chunk)
 
-    if eof_count > 1 or previous_xref_count > 0:
-    findings.append(
-        "Multiple PDF revision indicators detected; "
-        "review document changes and signature history"
-    )
+        file_sha256 = sha256.hexdigest()
+        checks["file_hash_check"] = "Completed"
 
-
-            created_raw = metadata.get("creationDate") or ""
-            modified_raw = metadata.get("modDate") or ""
-
-            def parse_pdf_date(value):
-                match = re.search(
-                    r"D:(\d{4})(\d{2})(\d{2})(\d{2})?(\d{2})?(\d{2})?",
-                    value
-                )
-                if not match:
-                    return None
-
-                parts = [int(x) if x else 0 for x in match.groups()]
-                try:
-                    return datetime(
-                        parts[0], parts[1], parts[2],
-                        parts[3], parts[4], parts[5]
-                    )
-                except ValueError:
-                    return None
-
-            created = parse_pdf_date(created_raw)
-            modified = parse_pdf_date(modified_raw)
-            now = datetime.now()
-
-            if not created:
-                findings.append(
-                    "PDF creation timestamp missing or unreadable"
-                )
-            elif created > now + __import__("datetime").timedelta(days=1):
-                findings.append("PDF creation timestamp is in the future")
-
-            if not modified:
-                findings.append(
-                    "PDF modification timestamp missing or unreadable"
-                )
-            elif modified > now + __import__("datetime").timedelta(days=1):
-                findings.append("PDF modification timestamp is in the future")
-
-            if created and modified and modified < created:
-                findings.append(
-                    "Modification timestamp is earlier than creation timestamp"
-                )
-
-            issue_match = re.search(
-                r"(?:date\s+of\s+issue|issue\s+date|issued\s+on)"
-                r"\s*[:\-]?\s*"
-                r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}"
-                r"|\d{1,2}[-/]\d{1,2}[-/]\d{4})",
-                document_text,
-                re.IGNORECASE
+        # PDF-specific checks.
+        if os.path.splitext(file_path)[1].lower() != ".pdf":
+            add_finding(
+                "PDF forensic checks were skipped because "
+                "the uploaded file is not a PDF."
             )
 
-            if issue_match:
-                raw = issue_match.group(1)
-                issue_date = None
+        else:
+            with pymupdf.open(file_path) as pdf:
+                page_count = len(pdf)
+                metadata = pdf.metadata or {}
 
-                for fmt in ("%Y-%m-%d", "%Y/%m/%d",
-                            "%d-%m-%Y", "%d/%m/%Y",
-                            "%m-%d-%Y", "%m/%d/%Y"):
-                    try:
-                        issue_date = datetime.strptime(raw, fmt)
-                        break
-                    except ValueError:
-                        pass
+                # 2. Check whether the PDF has a readable text layer.
+                extracted_pdf_text = "\n".join(
+                    page.get_text()
+                    for page in pdf
+                ).strip()
 
-                if issue_date:
-                    if issue_date > now + __import__("datetime").timedelta(days=1):
-                        findings.append(
-                            "Document issued date is in the future"
+                if not extracted_pdf_text:
+                    add_finding(
+                        "No selectable PDF text layer found. "
+                        "This may be a scanned document; "
+                        "font-based checks are limited."
+                    )
+
+                # 3. Inspect creation and modification metadata.
+                created_raw = metadata.get("creationDate") or ""
+                modified_raw = metadata.get("modDate") or ""
+
+                created = parse_pdf_date(created_raw)
+                modified = parse_pdf_date(modified_raw)
+                now = datetime.now()
+
+                if not created:
+                    add_finding(
+                        "Creation timestamp is missing or unreadable."
+                    )
+                elif created > now:
+                    add_finding(
+                        "PDF creation timestamp is in the future."
+                    )
+
+                if not modified:
+                    add_finding(
+                        "Modification timestamp is missing or unreadable."
+                    )
+                elif modified > now:
+                    add_finding(
+                        "PDF modification timestamp is in the future."
+                    )
+
+                if created and modified and modified < created:
+                    add_finding(
+                        "Modification timestamp is earlier than "
+                        "creation timestamp."
+                    )
+
+                checks["metadata_check"] = "Completed"
+
+                # 4. Inspect PDF revision indicators.
+                with open(file_path, "rb") as pdf_file:
+                    pdf_bytes = pdf_file.read()
+
+                eof_count = pdf_bytes.count(b"%%EOF")
+                previous_xref_count = pdf_bytes.count(b"/Prev")
+
+                if eof_count > 1 or previous_xref_count > 0:
+                    add_finding(
+                        "Multiple PDF revision indicators detected. "
+                        "This can occur during normal PDF editing; "
+                        "manual review is recommended."
+                    )
+
+                checks["revision_check"] = "Completed"
+
+                # 5. Check for unusual text font-size variations.
+                # This check applies only when selectable text exists.
+                font_check_possible = bool(extracted_pdf_text)
+
+                if font_check_possible:
+                    font_findings = []
+
+                    for page_number, page in enumerate(pdf, start=1):
+                        blocks = page.get_text("dict").get(
+                            "blocks", []
+                        )
+                        font_sizes = []
+
+                        for block in blocks:
+                            if block.get("type") != 0:
+                                continue
+
+                            for line in block.get("lines", []):
+                                for span in line.get("spans", []):
+                                    span_text = span.get(
+                                        "text", ""
+                                    ).strip()
+                                    size = span.get("size", 0)
+
+                                    if (
+                                        span_text
+                                        and isinstance(size, (int, float))
+                                        and size > 0
+                                    ):
+                                        font_sizes.append(float(size))
+
+                        if len(font_sizes) >= 10:
+                            sorted_sizes = sorted(font_sizes)
+                            median_size = sorted_sizes[
+                                len(sorted_sizes) // 2
+                            ]
+
+                            unusual_sizes = [
+                                size for size in font_sizes
+                                if size > median_size * 2.5
+                                or size < median_size * 0.4
+                            ]
+
+                            if unusual_sizes:
+                                font_findings.append(page_number)
+
+                    for page_number in font_findings:
+                        add_finding(
+                            f"Page {page_number}: unusual font-size "
+                            "variation detected. Manual review recommended."
                         )
 
-                    if modified and modified.date() > issue_date.date():
-                        findings.append(
-                            "PDF was modified after its stated issue date; review needed"
+                    checks["font_check"] = "Completed"
+                else:
+                    checks["font_check"] = "Not available: scanned PDF"
+
+                # 6. Compare explicitly labelled issue date with PDF
+                # modification metadata.
+                issue_match = re.search(
+                    r"(?:date\s+of\s+issue|issue\s+date|issued\s+on)"
+                    r"\s*[:\-]?\s*"
+                    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+                    r"|\d{1,2}[-/]\d{1,2}[-/]\d{4})",
+                    document_text or "",
+                    re.IGNORECASE
+                )
+
+                if issue_match:
+                    raw_date = issue_match.group(1)
+                    issue_date = None
+
+                    for fmt in (
+                        "%Y-%m-%d",
+                        "%Y/%m/%d",
+                        "%d-%m-%Y",
+                        "%d/%m/%Y",
+                        "%m-%d-%Y",
+                        "%m/%d/%Y"
+                    ):
+                        try:
+                            issue_date = datetime.strptime(
+                                raw_date, fmt
+                            )
+                            break
+                        except ValueError:
+                            continue
+
+                    if issue_date:
+                        if issue_date > now:
+                            add_finding(
+                                "Document issue date is in the future."
+                            )
+
+                        if modified and modified.date() > issue_date.date():
+                            add_finding(
+                                "PDF modification date is after the "
+                                "stated issue date. Manual review recommended."
+                            )
+
+                        checks["issue_date_check"] = "Completed"
+                    else:
+                        checks["issue_date_check"] = (
+                            "Not completed: issue date could not be parsed"
                         )
-            else:
-                findings.append(
-                    "Issue date not detected; manual review recommended"
-                )
+                else:
+                    checks["issue_date_check"] = (
+                        "Not available: explicitly labelled issue date "
+                        "was not detected"
+                    )
 
-            if getattr(pdf, "is_repaired", False):
-                findings.append(
-                    "PDF structure required repair when opened"
-                )
+                # 7. Look for PDF active-content indicators.
+                # These indicators alone do not prove malicious activity.
+                active_patterns = [
+                    (b"/JavaScript", "JavaScript"),
+                    (b"/JS", "JS action"),
+                    (b"/OpenAction", "OpenAction"),
+                    (b"/AA", "additional action"),
+                    (b"/Launch", "Launch action")
+                ]
 
-    except Exception as exc:
-        findings.append(
-            "Metadata analysis could not be completed"
+                detected_active_items = [
+                    label for pattern, label in active_patterns
+                    if pattern in pdf_bytes
+                ]
+
+                if detected_active_items:
+                    add_finding(
+                        "PDF active-content indicators detected: "
+                        + ", ".join(detected_active_items)
+                        + ". Inspect the document before trusting it."
+                    )
+
+                checks["active_content_check"] = "Completed"
+
+    except Exception:
+        app.logger.exception(
+            "PDF anomaly analysis failed for %s", file_path
         )
-        app.logger.warning("Anomaly analysis error: %s", exc)
+        add_finding(
+            "One or more forensic checks could not be completed."
+        )
+
+    # These checks identify indicators, not confirmed forgery.
+    if any(
+        item.startswith("PDF active-content indicators detected")
+        for item in findings
+    ):
+        risk_level = "High Review Priority"
+    elif findings:
+        risk_level = "Review Required"
+    else:
+        risk_level = "No Indicators Found"
 
     return {
         "anomalies": findings,
         "anomaly_count": len(findings),
-        "review_required": len(findings) > 0
+        "review_required": len(findings) > 0,
+        "risk_level": risk_level,
+        "checks": checks,
+        "file_sha256": file_sha256,
+        "page_count": page_count,
+        "metadata": {
+            "creation_date": metadata.get("creationDate"),
+            "modification_date": metadata.get("modDate"),
+            "creator": metadata.get("creator"),
+            "producer": metadata.get("producer")
+        }
     }
 
 
